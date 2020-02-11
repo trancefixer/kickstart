@@ -1,0 +1,709 @@
+#! /usr/bin/env bash
+# must be run as root
+
+# TODO: install sound themes
+# TODO: configure mutt
+# TODO: copy xpis to firefox directory to install extension?
+# TODO: go everywhere there is prompt and consider that a TODO
+
+# TODO: slideshow backgrounds, a la
+# http://ubuntuforums.org/showthread.php?t=1867303
+# http://www.linuxjournal.com/content/creating-slide-show-backgrounds-xfce
+# http://www.commandlinefu.com/commands/view/2057/pick-a-random-image-from-a-directory-and-subdirectories-every-thirty-minutes-and-set-it-as-xfce4-wallpaper
+
+# TODO: http://www.webupd8.org/2011/10/things-to-tweak-after-installing-ubuntu.html
+# TODO: http://www.consumedconsumer.org/2011/10/ubuntu-1110-oneiric-ocelot-tips-and.html
+# TODO: http://debianhelp.wordpress.com/2011/09/12/to-do-list-after-installing-ubuntu-11-10-aka-oneiric-ocelot/
+# TODO: http://ubuntulady.wordpress.com/2011/10/17/some-tweaks-for-oneiric/
+
+# Exit after any error.
+set -e
+
+# Extract codename of this release
+if type lsb_release > /dev/null
+then
+    rel="$(lsb_release --short --codename)"
+    distro="$(lsb_release --short --id)"
+elif test -r /etc/lsb-release
+then
+    . /etc/lsb-release
+    rel="$DISTRIB_CODENAME"
+    distro="$DISTRIB_ID"
+else
+    echo "Could not determine release from lsb info"
+    exit 1
+fi
+distro="$(echo $distro | tr A-Z a-z)"
+
+usage="\
+$0 [-a] [-t type] section...
+-a      put each sources.list line in its own file under
+        /etc/apt/sources.list.d
+-l      is only going to be used on local network, never stand-alone (i.e. is not mobile)
+-t      type of system; laptop, server, desktop, airgap, mythtv, xbmc
+section which section(s) of the program to run
+-w      type of WM; kde, gnome, xfce
+"
+
+# Put each sources.list line in its own file under
+# /etc/apt/sources.list.d
+apt_a=false
+
+# Is this a server?
+server=false
+# Is it a desktop?
+desktop=false
+# Is it a laptop?
+laptop=false
+# Is it an airgap system?
+airgap=false
+# Is it a mythtv box?
+mythtv=false
+# Is it a xbmc box?
+xbmc=false
+# Is it on my local network?
+local_network=false
+# Which WM
+gnome=false
+kde=false
+xfce=false
+unity=false # TODO - support later
+# install android tools?
+android=true
+# whether 32-bit or 64-bit
+arch=$(uname -m)
+# default upgrade target
+default_target=upgrade
+
+# Process command-line options
+while getopts "alt:w:" c
+do
+    case "$c" in
+	a) apt_a=true;;
+	l) local_network=true;;
+	t)
+	    case "$OPTARG" in
+		d*) desktop=true;;
+		l*) laptop=true;;
+		s*) server=true;;
+		a*) airgap=true;;
+		m*) mythtv=true;;
+		x*) xbmc=true;;
+		*) echo "$usage" >&2; exit 1;;
+	    esac
+	    ;;
+	w)
+	    case "$OPTARG" in
+		x*) xfce=true;;
+		g*) gnome=true;;
+		k*) kde=true;;
+		*) echo "$usage" >&2; exit 1;;
+	    esac
+	    ;;
+	h) echo "$usage"; exit 0;;
+	*) echo "$usage" >&2; exit 1;;
+    esac
+done
+shift $(($OPTIND - 1))
+
+# internal
+# Preserve file(s) by copying to *.orig
+orig () {
+    local f
+    for f in "$@"
+    do
+	if test -e "$f"
+	then
+	    test -e "$f".orig || cp "$f" "$f".orig
+	fi
+    done
+}
+
+# internal
+# Add a line if it doesn't exist
+line_extant () {
+    file="$1"
+    shift
+    if ! grep -q "^$*$" "$file"
+    then
+	echo "$*" >> "$file"
+    fi
+}
+
+# This kind of works; we don't look for the stanza but individual lines, so common lines like "end" or { screw this up.
+lines_extant () {
+    local file="$1"
+    shift
+    local line
+    while read line
+    do
+	line_extant "$file" "$line"
+    done
+}
+
+# Ignore it if these commands return non-zero.
+ign () { set +e; "$@"; set -e; return 0; }
+
+# internal
+# prompt the user with one line
+prompt () { echo "$@"; read f; }
+  
+# internal
+# prompt the user with multiple lines read from STDIN
+mass_prompt () { cat; read; }
+
+
+# TODO: make a backup of sources.list
+apt_add () {
+    local name="$1"
+    local type="$2"
+    local reporoot="$3"
+    local release="$4"
+    local sections="$5"
+    local key="$6"
+
+    if test -n "$key"
+    then
+	if expr "$key" : '^http.*' > /dev/null 2>&1
+	then
+	    # web URL for key
+            ign sh -c "wget -q \"$key\" -O- | apt-key add -"
+	else
+	    # by key ID
+	    gpg --list-key "$key" > /dev/null || ign sh -c "gpg --recv-keys \"$key\"; gpg --export \"$key\" | apt-key add -"
+	fi
+    fi
+
+    if apt-add-repository "$type $reporoot $release $sections"
+    then
+	:
+    else
+	if wget -q "$reporoot/dists/$release/Release" -O/dev/null
+	then
+	    if $apt_a
+	    then
+		line_extant /etc/apt/sources.list.d/"$name" "$type $reporoot $release $sections"
+	    else
+		line_extant /etc/apt/sources.list "$type $reporoot $release $sections"
+	    fi
+	fi
+    fi
+}
+
+package_install_single () {
+    sudo aptitude --with-recommends install "$@"
+}
+
+package_install () {
+    for i in "$@"; do package_install_single "$i"; done
+}
+
+install_screen () {
+    package_install byobu screen
+}
+
+# Comment out cdrom info in sources.list
+comment_cdrom_sources_list () {
+    perl -pi -e '/cdrom:/ and /^[^#]/ and s/^/#/' /etc/apt/sources.list
+}
+
+uncomment_partner () {
+    perl -pi -e '/partner$/ and s/^# //' /etc/apt/sources.list
+}
+
+# Add one repository; split from add_repos due to the way positional args work
+add_repo () {
+    local repo="$1"
+    set +e
+    cat_repos | while read line; do eval set -- $line; test "$repo" = "$1" && apt_add "$@"; done
+    set -e
+}
+
+# Add all the repositories mentioned on the command line
+add_repos () {
+    for i in "$@"; do add_repo "$i"; done
+}
+
+cat_repos () {
+    if test "$distro" = "ubuntu"
+    then
+	cat <<-EOF
+	medibuntu  deb http://packages.medibuntu.org/ $rel "free non-free" http://packages.medibuntu.org/medibuntu-key.gpg
+	unetbootin deb http://ppa.launchpad.net/gezakovacs/ppa/$distro $rel main 'http://keyserver.ubuntu.com:11371/pks/lookup?op=get&search=0xD45DF2E8FC91AE7E'
+	unetbootin deb-src http://ppa.launchpad.net/gezakovacs/ppa/$distro $rel main 'http://keyserver.ubuntu.com:11371/pks/lookup?op=get&search=0xD45DF2E8FC91AE7E'
+        handbrake  deb http://ppa.launchpad.net/stebbins/handbrake-releases/$distro $rel main 'http://keyserver.ubuntu.com:11371/pks/lookup?op=get&search=0x8771ADB0816950D8'
+        handbrake  deb-src http://ppa.launchpad.net/stebbins/handbrake-releases/$distro $rel main 'http://keyserver.ubuntu.com:11371/pks/lookup?op=get&search=0x8771ADB0816950D8'
+        lyx ppa:lyx-devel/release $rel main ''
+EOF
+    fi
+
+    cat <<-EOF
+	medibuntu  deb http://packages.medibuntu.org/ $rel "free non-free" http://packages.medibuntu.org/medibuntu-key.gpg
+	dfreer     deb http://packages.dfreer.org/ $rel main http://packages.dfreer.org/7572013D.gpg
+	virtualbox deb http://download.virtualbox.org/virtualbox/debian $rel contrib http://download.virtualbox.org/virtualbox/debian/oracle_vbox.asc
+	wine       deb http://wine.budgetdedicated.com/apt $rel main http://wine.budgetdedicated.com/apt/387EE263.gpg
+	tor        deb http://deb.torproject.org/torproject.org $rel main A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
+EOF
+}
+
+apt_update () {
+    aptitude update || true
+}
+
+azureus_desktop () {
+    test -e /usr/share/applications/Azureus.desktop || cat > /usr/share/applications/Azureus.desktop <<EOF
+[Desktop Entry]
+Encoding=UTF-8
+Type=Application
+Terminal=false
+Name=Azureus
+Exec=/usr/local/azureus/azureus
+Comment=Java BitTorrent client
+Categories=Application;Network;
+MimeType=application/x-bittorrent;
+Icon=/usr/local/azureus/Azureus.png
+EOF
+}
+
+install_codec_packages () {
+    case "$(uname -m)"
+	in
+	x86_64) codecs="w64codecs";;
+	i[3456]86) codecs="w32codecs";;
+	*) codecs="";
+    esac
+}
+
+install_base_packages () {
+    apt-get install sudo
+    time="ntpdate ntp"
+    system="openssh-server mysql-client reiserfsprogs lvm2 psutils smartmontools eject gdisk mdadm veracrypt"
+    dev="screen byobu emacs"
+    sec="apg gnupg debian-keyring"
+    net="whois traceroute nmap"
+    _base="$time $system $dev $webtxt $mailtxt $mediacode $mediafiles $ebooks $audio $webauth $restricted $comp $fonts $sec $net"
+    package_install $_base
+}
+
+install_common_packages () {
+    install_base_packages
+    dev="python-mode ruby ruby-elisp subversion m4 make"
+    webtxt="curl elinks w3m"
+    mailtxt="mutt-patched"
+    mediacode="mencoder avidemux transcode ffmpeg2theora"
+    mediafiles="mkvtoolnix mkvtoolnix-gui"
+    ebooks="chm2pdf pdf2djvu"
+    audio="sox normalize-audio id3v2"
+    webauth="python-markdown emacs-goodies-el python-docutils"
+    # restricted="ubuntu-restricted-extras"
+    comp="rar unrar p7zip-full unace bzip2 unzip"
+    lyx="lyx texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended preview-latex-style dvipng imagemagick psutils ghostscript poppler-utils ttf-lyx"
+    lyx_suggest="rcs dvipost librsvg2-bin elyxer tth groff libtiff-tools gnuhtml2latex wv chktex noweb menu sgmltools-lite linuxdoc-tools writer2latex latex2rtf"
+    textproc="$lyx $lyx_suggest"
+    _common="$textproc $time $system $dev $webtxt $mailtxt $mediacode $mediafiles $ebooks $audio $webauth $restricted $comp $fonts $sec $net"
+    package_install $_common
+}
+
+install_packager_packages () {
+    ubudev="build-essential devscripts ubuntu-dev-tools debhelper dh-make diff patch quilt gnupg fakeroot lintian pbuilder"
+    debdev="dpkg-dev file gcc g++ libc6-dev make perl autoconf automake"
+    debdox="debian-policy developers-reference"
+    reprepro="reprepro gnupg"
+    _packager="$ubudev $debdev $debdox $reprepro"
+    package_install $_packager
+}
+
+install_desktop_packages () {
+    add-apt-repository ppa:webupd8team/unstable
+    textproc_gui="pdf-viewer"
+    office="$textproc_gui netpbm hevea ktimer kdvi dblatex xsane"
+    system="unetbootin virtualbox gparted ntfs-3g virt-manager virt-viewer"
+    accessories="digikam"
+    im="pidgin pidgin-otr gstreamer0.10-plugins-base gstreamer0.10-plugins-good"
+    #pdfgui="acroread acroread-plugins acroread-escript"
+    chmgui="chmsee xchm"
+    djvugui="djvu-viewer"
+    ebooksgui="$pdfgui $chmgui $dvjugui calibre"
+    webgui="firefox flashplugin-nonfree mozilla-mplayer"
+    mailgui="thunderbird"
+    cd="grip"
+    players="vlc vlc-plugin-* feh qiv xloadimage xine-ui mpg123 totem libvdpau1"
+    $gnome && players="$players gnome-mplayer totem"
+    $kde && players="$players kmplayer kaffeine"
+    dvd="dvdrip k9copy k3b dvdbackup libdvdcss2 handbrake-gtk" # devede
+    p2p="azureus"
+    audio_gui="amarok sound-juicer"
+    fonts="msttcorefonts ttf-xfree86-nonfree xfs x-ttcidfont-conf"
+    sec="password-gorilla"
+    if $android
+    then
+	# http://www.webupd8.org/2012/12/how-to-mount-android-40-ubuntu-go-mtpfs.html
+	# http://android.stackexchange.com/questions/53243/how-do-i-mount-my-samsung-galaxy-s4-on-ubuntu
+	android_pkg="sun-java6-jdk eclipse go-mtpfs go-mtpfs-unity gMTP"
+    fi
+    _desktop="$office $system $ebooksgui $accessories $im $ebooksgui $webgui $mailgui $cd $players $dvd $p2p $audio_gui $fonts $sec $android_pkg"
+    package_install $_desktop
+}
+
+install_laptop_packages () {
+    if $kde
+    then
+    	_laptop="wicd"
+    fi
+    if $gnome
+    then
+	_laptop="network-manager-gnome network-manager-openvpn-gnome"
+    fi
+    if $xfce
+    then
+	echo Unknown which network manager to use.
+	_laptop=""
+    fi
+    package_install $_laptop
+}
+
+install_mythtv_packages () {
+    _mythtv="mythbuntu-desktop libavcodec-extra-52"
+    package_install $_mythtv
+}
+
+install_xbmc_packages () {
+    _xbmc="fceu ivtv-utils vlc"
+    package_install $_xbmc
+}
+
+apt_install () {
+    package_install $_common $_packager $_desktop $_laptop $_mythtv $_xbmc
+}
+
+config_autofs () {
+    package_install autofs portmap nfs-common
+    # enable /net automounting
+    perl -pi -e 's!^#/net!/net!' /etc/auto.master
+    test -d /net || mkdir /net && chmod 0755 /net
+    /etc/init.d/autofs restart
+}
+
+apt_safe_upgrade () {
+    # make sure everything is up-to-date
+    aptitude safe-upgrade
+}
+
+font_cache () {
+    # regenerate the font cache
+    fc-cache -f -v
+}
+
+latex_cv () {
+    # install CV (resume) latex class
+    local d=/usr/share/texmf/tex/latex
+    if test -d "$d" && test \! -e "$d"/cv.cls
+    then
+	(cd "$d" && wget http://wiki.lyx.org/uploads/Examples/CV/cv.cls && chmod 644 cv.cls && texhash)
+    fi
+}
+
+ssh_dir () {
+    # Copy .ssh directory, if it exists, to ~root/.ssh
+    if test -e $(pwd)/.ssh
+    then
+	rsync -rlptgDvH $(pwd)/.ssh/ ~root/.ssh/
+    fi
+}
+
+# TODO: Is this good enough?
+skel_setup () {
+    rsync --delete -rlptgD skel/ /etc/skel/
+    chown -R root:root /etc/skel
+}
+
+# add user
+au () { local un="$1"; local ge="$2"; shift 2; ign adduser --gecos "$ge" --disabled-password "$@" "$un"; }
+
+# add user with userid
+aui () { local uid="$1"; shift; au "$@" --uid "$uid"; }
+
+# add a user to a group
+addtogroup () { local u; local g="$1"; shift; for u in "$@"; do ign sudo adduser "$u" "$g"; done; }
+
+nopasswd () {
+    # add NOPASSWD option to sudoers
+    if test -d /etc/sudoers.d
+    then
+	echo "%admin  ALL=(ALL)       NOPASSWD: ALL" > /etc/sudoers.d/admin_nopasswd # old?
+	echo "%root   ALL=(ALL)       NOPASSWD: ALL" > /etc/sudoers.d/root_nopasswd # new
+	chmod 0440 /etc/sudoers.d/* # fix perms
+    else
+	line_extant /etc/sudoers "%admin  ALL=(ALL)       NOPASSWD: ALL"
+    fi
+}
+
+snmpd () {
+    package_install snmpd
+    # Make it listen on all interfaces
+    line_extant /etc/snmp/snmpd.conf "agentAddress udp:161"
+}
+
+# optional
+config_postfix () {
+    package_install postfix
+    prompt edit main.cf
+    (cd /etc/postfix
+    for i in whitelist_sender whitelist_client
+    do
+	install -c -m 0600 /dev/null "$i"
+	postmap hash:"$i"
+    done)
+    cp -pf /etc/localtime /var/spool/postfix/etc/localtime
+}
+
+config_procmail () {
+    cat > /etc/procmailrc <<-"EOF"
+	PATH=/bin:/usr/bin:/usr/local/bin
+	MAILDIR=$HOME/Maildir/
+	DEFAULT=$MAILDIR/INBOX/
+EOF
+    chmod u=rw,og=r /etc/procmailrc
+}
+
+# optional
+mailserver () {
+    # lbdb = little brother data base, used by procmail scripts
+    package_install procmail lbdb sasl2-bin libsasl2-modules
+    config_postfix
+    config_procmail
+}
+
+truecrypt () {
+    case "$arch"
+	in
+	x86_64) ./truecrypt-7.0a-setup-x64 ;;
+	i686) ./truecrypt-7.0a-setup-x86 ;;
+	*) echo "Error: unknown arch - not installing truecrypt" ;;
+    esac
+}
+
+bind () {
+    package_install bind9
+}
+
+acrobat_fix () {
+    fn=/opt/Adobe/Reader9/Browser/intellinux/nppdf.so
+    if test -e "$fn"
+    then
+        nspluginwrapper -i "$fn"
+    else
+        echo "could not find nppdf.so to fix acrobat"
+    fi
+}
+
+install_webserver () {
+    package_install apache2 libapache-mod-security apache2-utils
+}
+
+config_smartd () {
+    package_install smartmontools
+    perl -pi.orig -e 's/^#start_smartd/start_smartd/' /etc/default/smartmontools
+    service smartd restart || service smartmontools restart
+}
+
+# If it was set up by/for someone else
+reconfigure_system() {
+    prompt set up /etc/localtime
+    prompt set up /etc/hostname
+    prompt set up /etc/resolv.conf
+    prompt "set up /etc/hosts (set hostname and domain name)"
+}
+
+# Set the background to a filename, for any windowing system
+set_background () {
+    # per http://www.itworld.com/software/188517/how-customize-ubuntus-unity-desktop-environment
+    if $gnome
+    then
+	if "$(gnome-session --version | sed -e 's/.* //; s/\..*//')" -gt 2
+	then
+	    gsettings set org.gnome.desktop.background picture-uri file://"$@" # works for unity also
+	else
+	    gconftool-2 --type string --set /desktop/gnome/background/picture_filename "$@"
+	fi
+    fi
+    if $kde
+    then
+	# TODO: fix this
+	cat >&2 <<-"EOF"
+	Warning: I do not know how to set background from command line in KDE
+	See:
+	http://forum.kde.org/viewtopic.php?f=64&t=63342
+	http://blog.zx2c4.com/699
+	EOF
+    fi
+    if $xfce
+    then
+	# TODO: fix this
+	cat >&2 <<-"EOF"
+	Warning: I do not know how to set background from command line in XFCE
+	See:
+	http://phantomsdad.blogspot.com/2011/09/set-wallpaper-in-xfce4-from-command.html
+	http://ubuntuforums.org/showthread.php?t=838184
+	EOF
+    fi
+}
+
+install_sound_theme () {
+    if $gnome
+    then
+	dest=/usr/share/sounds/"$1"
+	cp -pR "$1" "$dest"
+	chown -R root:root "$dest"
+	chmod -R a+rX "$dest"
+	# TODO: set it as default w/o using GUI?
+	# TODO: set up pidgin w/o using GUI?
+    fi
+}
+
+install_android () {
+    local url='http://dl.google.com/android/android-sdk_r10-linux_x86.tgz'
+    local fn="${url##*/}"
+    test -e "$fn" || wget "$url"
+    tar -xvzf "$fn"
+}
+
+install_colormanager () {
+    if true
+    then
+	# redshift
+	sudo add-apt-repository ppa:jonls/redshift-ppa
+	sudo aptitude install redshift
+    else
+	# FAIL on 64-bit Linux
+	sudo add-apt-repository ppa:kilian/f.lux
+	sudo apt-get install fluxgui
+    fi
+}
+
+disable_ipv6 () {
+    lines_extant /etc/sysctl.conf <<-'EOF'
+	# disable ipv6
+	net.ipv6.conf.all.disable_ipv6 = 1
+	net.ipv6.conf.default.disable_ipv6 = 1
+	# Makes postgrey fail if set
+	# net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    sysctl -p
+    lines_extant /etc/ssh/sshd_config <<-'EOF'
+	# This fixes a ssh/X11 forwarding problem"
+	# http://www.linuxquestions.org/questions/linux-networking-3/x-forwarding-though-ssh-not-working-$display-not-set-879365/
+	AddressFamily inet
+EOF
+}
+
+distro_fixes () {
+    case "$distro" in
+	ubuntu)
+	    apt-get -y install python-software-properties software-properties-common # to manage repositories with add-apt-repository
+	    ;;
+	debian)
+	    apt-add-repository () { line_extant /etc/apt/sources.list "$1"; }
+	    apt-get -y install sudo
+	    ;;
+    esac
+}
+
+upgrade () {
+    apt-get -y install aptitude
+
+    # remove cdrom from sources.list
+    comment_cdrom_sources_list
+    # uncomment partner repo
+    uncomment_partner
+    # add all repos
+    add_repos medibuntu dfreer virtualbox wine unetbootin tor handbrake
+    # now do an update to get the new packages
+    apt_update
+
+    # azureus_desktop
+
+    $airgap || install_common_packages
+
+    $mythtv && install_mythtv_packages
+
+    $xbmc && install_xbmc_packages
+
+    ($desktop || $laptop) && install_desktop_packages
+
+    ($desktop || $laptop) && install_colormanager
+
+    ($desktop || $laptop) && install_packager_packages
+
+    ($desktop || $laptop) && $android && install_android
+
+    # TODO:
+    #($desktop || $laptop) && install_codecs
+
+    $laptop && install_laptop_packages
+	
+    apt_install
+
+    $local_network && config_autofs
+
+    apt_safe_upgrade
+
+    font_cache
+
+    ($desktop || $laptop) && latex_cv
+
+    ($server || $laptop) && skel_setup # set up /etc/skel for basic home directories
+
+    ssh_dir
+
+    nopasswd
+
+    # TODO: this isn't SVN-controlled, so may fail
+    truecrypt || true
+
+    # Fix acrobat to run on 64-bit arches
+    ($desktop || $laptop) && test "$arch" != "i686" && acrobat_fix
+
+    $airgap || snmpd
+
+    $laptop && bind
+
+    if $desktop
+    then
+	cat <<EOF
+Now add these to xorg.conf:
+ FontPath "/var/lib/defoma/x-ttcidfont-conf.d/dirs/TrueType"
+ FontPath "/var/lib/defoma/x-ttcidfont-conf.d/dirs/CID"
+EOF
+    else
+	:
+    fi
+}
+
+# Main installation routine
+auto_upgrade () {
+    # First install screen
+    install_screen
+    # Then run the rest of the upgrade under screen
+    exit 0
+    # TODO: does not pass flags (server, for example)
+    screen sh -c "./$0 upgrade 2>&1 | tee -a ./$0.out"
+}
+
+if test -e $0.local
+then
+    echo Reading localized script
+    . $0.local
+fi
+
+# If no command line arguments set, assume target is "upgrade"
+test -z "$*" && set -- $default_target
+
+distro_fixes
+umask 077 # safe default
+
+for target in "$@"
+do
+    eval $target
+done
+echo "Finished"
